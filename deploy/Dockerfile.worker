@@ -1,0 +1,15 @@
+ARG REGISTRY=docker.io
+FROM ${REGISTRY}/golang:1.22-alpine AS builder
+WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GONOSUMCHECK=* GONOSUMDB=*
+COPY go.mod ./
+RUN go mod download
+COPY . ./
+ARG WORKER
+RUN CGO_ENABLED=0 go build -o /worker ./cmd/$WORKER
+
+FROM ${REGISTRY}/alpine:3.19
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /worker /worker
+ENTRYPOINT ["/worker"]

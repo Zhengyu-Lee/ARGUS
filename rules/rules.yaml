@@ -1,0 +1,64 @@
+rules:
+  # ── 内容匹配规则 ──
+
+  - name: cve-detection
+    description: "命中 CVE 编号，提升置信度，推入候选队列"
+    when:
+      matches_regex: "CVE-\\d{4}-\\d{4,}"
+    then:
+      add_tag: ["vulnerability"]
+      boost_confidence: 30
+      publish_to: "ioc-candidate"
+
+  - name: ip-port-c2
+    description: "暗网/黑客论坛中出现 IP:Port 格式，疑似 C2"
+    when:
+      matches_regex: "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}:\\d{2,5}"
+      source_is: ["darkweb", "hacker-forum"]
+    then:
+      add_tag: ["c2"]
+      boost_confidence: 25
+      publish_to: "ioc-candidate"
+      trigger_alert_if: "> 80"
+
+  - name: hash-indicator
+    description: "包含文件哈希，可能是恶意样本"
+    when:
+      matches_regex: "\\b[a-fA-F0-9]{32,64}\\b"
+    then:
+      add_tag: ["hash-indicator"]
+      boost_confidence: 15
+      publish_to: "ioc-candidate"
+
+  - name: email-phishing
+    description: "出现在安全上下文中的邮箱"
+    when:
+      matches_regex: "\\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}\\b"
+      source_is: ["darkweb", "hacker-forum"]
+    then:
+      add_tag: ["phishing"]
+      boost_confidence: 20
+      publish_to: "ioc-candidate"
+
+  # ── 置信度路由规则（按顺序匹配）──
+
+  - name: high-confidence-auto-push
+    description: "置信度 >= 80，自动推入 MISP + OpenCTI"
+    when:
+      confidence: ">= 80"
+    then:
+      publish_to: "ioc-confirmed"
+
+  - name: medium-confidence-review
+    description: "置信度 60-79，进入人工审核队列"
+    when:
+      confidence: "60-79"
+    then:
+      publish_to: "human-review"
+
+  - name: low-confidence-store
+    description: "置信度 < 60，仅存入 ES"
+    when:
+      confidence: "< 60"
+    then:
+      publish_to: "es-store"

@@ -1,0 +1,242 @@
+services:
+  # ?? Event Bus ??
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      - ZOOKEEPER_CLIENT_PORT=2181
+      - ZOOKEEPER_TICK_TIME=2000
+    healthcheck:
+      test: echo stat | nc localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKER_ID=0
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+    healthcheck:
+      test: nc -z localhost 9092
+      interval: 10s
+      timeout: 5s
+      retries: 15
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["bash", "-c", "
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic raw-data --partitions 4 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic enriched --partitions 4 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ioc-candidate --partitions 4 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic ioc-confirmed --partitions 2 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic human-review --partitions 2 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic es-store --partitions 4 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic alert --partitions 2 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic task-queue --partitions 2 --replication-factor 1
+    "]
+
+  # ?? Temporal (???????) ??
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      - postgres
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ?? ARGUS Workers ??
+
+  dedup-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: dedup-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - DEDUP_STORE=file
+      - DEDUP_DIR=/data/dedup
+    volumes:
+      - argus-data:/data
+
+  device-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: device-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - DEVICE_POOL_SIZE=10
+
+  rss-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: rss-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+
+  cleaner-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: cleaner-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+
+  rule-engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: rule-engine
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - RULES_PATH=/etc/argus/rules.yaml
+    volumes:
+      - ../rules:/etc/argus:ro
+
+  es-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: es-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - DATA_DIR=/data
+    volumes:
+      - argus-data:/data
+
+  alert-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: alert-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - SLACK_WEBHOOK=${SLACK_WEBHOOK:-}
+
+  review-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: review-api
+    ports:
+      - "8090:8090"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - TEMPORAL_HOST=temporal:7233
+      - LISTEN_ADDR=:8090
+
+  misp-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: misp-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - MISP_URL=${MISP_URL:-http://misp:8080}
+      - MISP_KEY=${MISP_KEY:-}
+
+  opencti-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: opencti-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - OPENCTI_URL=${OPENCTI_URL:-http://opencti:4000}
+      - OPENCTI_TOKEN=${OPENCTI_TOKEN:-}
+
+
+  temporal-worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+      args:
+        WORKER: temporal-worker
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - TEMPORAL_HOST=temporal:7233
+
+volumes:
+  argus-data:
+
+
+
+
+
+
+
